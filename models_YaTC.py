@@ -71,7 +71,7 @@ class TrafficTransformer(timm.models.vision_transformer.VisionTransformer):
         return x
 
     def forward_features(self, x):
-        B, C, H, W = x.shape
+        B, C, _, _ = x.shape
         x = x.reshape(B, C, 5, -1)
         for i in range(5):
             packet_x = x[:, :, i, :]
@@ -87,9 +87,9 @@ class TrafficTransformer(timm.models.vision_transformer.VisionTransformer):
             x = blk(x)
 
         x = x.reshape(B, 5, 21, -1)[:, :, 0, :]
-        x = x.mean(dim=1)
-
+        # x = x.mean(dim=1)
         outcome = self.fc_norm(x)
+        
         return outcome
 
 

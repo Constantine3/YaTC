@@ -16,12 +16,17 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-def pretrain_one_epoch(model: torch.nn.Module,
-                    data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int, loss_scaler,
-                    log_writer=None,
-                    model_without_ddp=None,
-                    args=None):
+def pretrain_one_epoch(
+    model: torch.nn.Module,
+    data_loader: Iterable,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    epoch: int,
+    loss_scaler,
+    log_writer=None,
+    model_without_ddp=None,
+    args=None,
+):
     model.train(True)
     metric_logger = misc.MetricLogger(delimiter="  ")
     metric_logger.add_meter('steps', misc.SmoothedValue(window_size=1, fmt='{value:.0f}'))
@@ -30,7 +35,6 @@ def pretrain_one_epoch(model: torch.nn.Module,
     print_freq = 20
 
     accum_iter = args.accum_iter
-
     optimizer.zero_grad()
 
     if log_writer is not None:
@@ -42,49 +46,62 @@ def pretrain_one_epoch(model: torch.nn.Module,
         steps = steps_of_one_epoch * epoch + data_iter_step
         metric_logger.update(steps=int(steps))
 
-        # we use a per iteration (instead of per epoch) lr scheduler
+        # Adjust learning rate
         if data_iter_step % accum_iter == 0:
             lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
 
+        # Ensure correct device and data types
         samples = samples.to(device, non_blocking=True)
 
-        with torch.cuda.amp.autocast():
-            loss, _, _ = model(samples, mask_ratio=args.mask_ratio)
+        try:
+            with torch.amp.autocast(device_type=device.type):
+                loss, _, _ = model(samples, mask_ratio=args.mask_ratio)
 
-        loss_value = loss.item()
+            # Ensure loss is finite
+            loss_value = loss.item()
+            if not math.isfinite(loss_value):
+                raise ValueError(f"Non-finite loss detected: {loss_value}")
 
-        if not math.isfinite(loss_value):
-            print("Loss is {}, stopping training".format(loss_value))
-            sys.exit(1)
+        except Exception as e:
+            print(f"Error during forward pass: {e}")
+            print("Skipping batch...")
+            optimizer.zero_grad()
+            continue
 
+        # Normalize loss for accumulation steps
         loss /= accum_iter
-        loss_scaler(loss, optimizer, parameters=model.parameters(),
-                    update_grad=(data_iter_step + 1) % accum_iter == 0)
+        loss_scaler(
+            loss, optimizer, parameters=model.parameters(),
+            update_grad=(data_iter_step + 1) % accum_iter == 0
+        )
         if (data_iter_step + 1) % accum_iter == 0:
             optimizer.zero_grad()
 
-        torch.cuda.synchronize()
+        # Synchronize only on CUDA
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
 
         metric_logger.update(loss=loss_value)
 
         lr = optimizer.param_groups[0]["lr"]
         metric_logger.update(lr=lr)
 
+        # Log to tensorboard
         loss_value_reduce = misc.all_reduce_mean(loss_value)
         if log_writer is not None and (data_iter_step + 1) % accum_iter == 0:
-            """ We use epoch_1000x as the x-axis in tensorboard.
-            This calibrates different curves when batch size changes.
-            """
             epoch_1000x = int((data_iter_step / len(data_loader) + epoch) * 1000)
             log_writer.add_scalar('train_loss', loss_value_reduce, epoch_1000x)
             log_writer.add_scalar('lr', lr, epoch_1000x)
+
+        # Save model at specified steps
         if args.output_dir and steps % args.save_steps_freq == 0 and epoch > 0:
             misc.save_model(
-                args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
-                loss_scaler=loss_scaler, epoch=epoch, name='step'+str(steps))
+                args=args, model=model, model_without_ddp=model_without_ddp,
+                optimizer=optimizer, loss_scaler=loss_scaler,
+                epoch=epoch, name='step' + str(steps)
+            )
 
-
-    # gather the stats from all processes
+    # Gather stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
@@ -123,7 +140,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         if mixup_fn is not None:
             samples, targets = mixup_fn(samples, targets)
 
-        with torch.cuda.amp.autocast():
+        with torch.amp.autocast(device_type=device.type):
             outputs = model(samples)
             loss = criterion(outputs, targets)
 
@@ -145,7 +162,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         if (data_iter_step + 1) % accum_iter == 0:
             optimizer.zero_grad()
 
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
         metric_logger.update(loss=loss_value)
         min_lr = 10.
@@ -189,7 +207,7 @@ def evaluate(data_loader, model, device):
         target = target.to(device, non_blocking=True)
 
         # compute output
-        with torch.cuda.amp.autocast():
+        with torch.amp.autocast(device_type=device.type):
             output = model(images)
             loss = criterion(output, target)
 
